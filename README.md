@@ -1,2 +1,2 @@
-# HyprCandy-
+# HyprCandy
 Enhanced  HyprCandy Hyprland Setup
