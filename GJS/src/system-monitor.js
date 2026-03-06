@@ -85,6 +85,24 @@ function getDiskInfo() {
 
 function getGPUInfo() {
     let gpus = [];
+    let detectedIntelGPUs = new Set();
+    
+    // Get GPU names from lspci as fallback
+    let gpuNames = {};
+    try {
+        let [ok,stdout] = GLib.spawn_command_line_sync('lspci | grep -i vga');
+        if (ok && stdout) {
+            let lines = imports.byteArray.toString(stdout).trim().split('\n');
+            for (let line of lines) {
+                let match = line.match(/^(\d{2}:\d{2}\.\d+)\s+.*:\s*(.+)$/);
+                if (match) {
+                    gpuNames[match[1]] = match[2];
+                }
+            }
+        }
+    } catch(e){}
+    
+    // NVIDIA GPU detection
     if (_hasNvidiaSmi===null) _hasNvidiaSmi = !!GLib.find_program_in_path('nvidia-smi');
     if (_hasNvidiaSmi) {
         try {
@@ -93,32 +111,164 @@ function getGPUInfo() {
                 for (let l of imports.byteArray.toString(stdout).trim().split('\n')) {
                     if (!l.trim()) continue;
                     let p=l.split(',').map(s=>s.trim());
-                    gpus.push({name:(p[1]||'NVIDIA').replace(/NVIDIA\s*GeForce\s*/i,'').trim(),usage:parseInt(p[0])||0,temp:parseInt(p[2])||0,type:'nvidia'});
+                    let gpuName = (p[1]||'NVIDIA').replace(/NVIDIA\s*GeForce\s*/i,'').trim();
+                    gpus.push({name:gpuName,usage:parseInt(p[0])||0,temp:parseInt(p[2])||0,type:'nvidia'});
                 }
             }
         } catch(e){}
     }
+    
+    // AMD GPU detection - improved with alternative metrics
     try {
-        for (let i=0;i<8;i++) {
-            let bp=`/sys/class/drm/card${i}/device/gpu_busy_percent`;
-            if (!GLib.file_test(bp,GLib.FileTest.EXISTS)) continue;
-            let [ok,c]=GLib.file_get_contents(bp); if(!ok) continue;
-            let usage=parseInt(imports.byteArray.toString(c).trim()), name='AMD GPU', temp=0;
-            try { let [nok,nc]=GLib.file_get_contents(`/sys/class/drm/card${i}/device/product_name`); if(nok){let n=imports.byteArray.toString(nc).trim();if(n)name=n;} } catch(e){}
-            try { let [tok,tc]=GLib.file_get_contents(`/sys/class/drm/card${i}/device/hwmon/hwmon0/temp1_input`); if(tok)temp=Math.round(parseInt(imports.byteArray.toString(tc).trim())/1000); } catch(e){}
-            gpus.push({name,usage:isNaN(usage)?0:usage,temp,type:'amd'});
-        }
-    } catch(e){}
-    try {
-        for (let i=0;i<8;i++) {
+        for (let i=0;i<16;i++) {
             let dp=`/sys/class/drm/card${i}/device/driver`;
             if (!GLib.file_test(dp,GLib.FileTest.IS_SYMLINK)) continue;
-            let [ok,out]=GLib.spawn_command_line_sync(`readlink -f ${dp}`); if(!ok) continue;
+            let [ok,out]=GLib.spawn_command_line_sync(`sudo readlink -f ${dp}`); if(!ok) continue;
             let d=imports.byteArray.toString(out).trim();
-            if ((d.includes('i915')||d.includes('xe'))&&!gpus.some(g=>g.type==='intel'))
-                gpus.push({name:'Intel iGPU',usage:-1,temp:0,type:'intel'});
+            
+            if (d.includes('amdgpu') || d.includes('radeon')) {
+                let usage = 0, temp = 0, name = 'AMD GPU';
+                
+                // Try multiple usage metrics with sudo
+                try {
+                    let bp=`/sys/class/drm/card${i}/device/gpu_busy_percent`;
+                    if (GLib.file_test(bp,GLib.FileTest.EXISTS)) {
+                        let [ok,c]=GLib.spawn_command_line_sync(`sudo cat ${bp}`);
+                        if (ok) usage = parseInt(imports.byteArray.toString(c).trim());
+                    }
+                } catch(e){}
+                
+                // Fallback to memory usage if GPU busy not available (with sudo)
+                if (isNaN(usage) || usage === 0) {
+                    try {
+                        let [tok,total] = GLib.spawn_command_line_sync(`sudo cat /sys/class/drm/card${i}/device/mem_info_vram_total`);
+                        let [uok,used] = GLib.spawn_command_line_sync(`sudo cat /sys/class/drm/card${i}/device/mem_info_vram_used`);
+                        if (tok && uok) {
+                            let totalMem = parseInt(imports.byteArray.toString(total).trim());
+                            let usedMem = parseInt(imports.byteArray.toString(used).trim());
+                            if (totalMem > 0) usage = Math.round((usedMem / totalMem) * 100);
+                        }
+                    } catch(e){}
+                }
+                
+                // Try to get temperature with sudo
+                try {
+                    let tempPaths = [
+                        `/sys/class/drm/card${i}/device/hwmon/hwmon1/temp1_input`,
+                        `/sys/class/drm/card${i}/device/hwmon/hwmon2/temp1_input`,
+                        `/sys/class/drm/card${i}/device/hwmon/hwmon3/temp1_input`,
+                        `/sys/class/drm/card${i}/device/hwmon/hwmon0/temp1_input`
+                    ];
+                    for (let tempPath of tempPaths) {
+                        let [tok,tc]=GLib.spawn_command_line_sync(`sudo cat ${tempPath}`);
+                        if(tok){
+                            temp=Math.round(parseInt(imports.byteArray.toString(tc).trim())/1000);
+                            if (temp > 0 && temp < 150) break;
+                        }
+                    }
+                } catch(e){}
+                
+                // Get GPU name from lspci or sysfs with sudo
+                try {
+                    let [nok,nc]=GLib.spawn_command_line_sync(`sudo cat /sys/class/drm/card${i}/device/product_name`);
+                    if(nok){
+                        let n=imports.byteArray.toString(nc).trim();
+                        if(n) name = n;
+                    }
+                } catch(e){}
+                
+                // Fallback to lspci name with sudo
+                try {
+                    let [ok,addr] = GLib.spawn_command_line_sync(`sudo cat /sys/class/drm/card${i}/device/address`);
+                    if (ok) {
+                        let addrStr = imports.byteArray.toString(addr).trim();
+                        if (gpuNames[addrStr]) {
+                            name = gpuNames[addrStr].replace(/Advanced Micro Devices.*AMD\/ATI\s*/i, 'AMD ').replace(/\[.*?\]\s*/g, '');
+                        }
+                    }
+                } catch(e){}
+                
+                // Determine GPU type based on name patterns
+                let gpuType = 'amd';
+                if (name.toLowerCase().includes('mobile') || name.toLowerCase().includes('m') || 
+                    name.toLowerCase().includes('radeon') || name.toLowerCase().includes('hd')) {
+                    gpuType = 'amd_dgpu';
+                    if (!name.includes('(dGPU)')) name += ' (dGPU)';
+                } else {
+                    gpuType = 'amd_igpu';
+                    if (!name.includes('(iGPU)')) name += ' (iGPU)';
+                }
+                
+                gpus.push({name:name.replace(/AMD\s*/i, '').trim(),usage:isNaN(usage)?0:usage,temp,type:gpuType});
+            }
         }
     } catch(e){}
+    
+    // Intel GPU detection - improved
+    try {
+        for (let i=0;i<16;i++) {
+            let dp=`/sys/class/drm/card${i}/device/driver`;
+            if (!GLib.file_test(dp,GLib.FileTest.IS_SYMLINK)) continue;
+            let [ok,out]=GLib.spawn_command_line_sync(`sudo readlink -f ${dp}`); if(!ok) continue;
+            let d=imports.byteArray.toString(out).trim();
+            
+            if (d.includes('i915')||d.includes('xe')) {
+                let temp = 0, name = 'Intel GPU';
+                
+                // Try to get temperature with sudo
+                try {
+                    let tempPaths = [
+                        `/sys/class/drm/card${i}/device/hwmon/hwmon1/temp1_input`,
+                        `/sys/class/drm/card${i}/device/hwmon/hwmon2/temp1_input`,
+                        `/sys/class/drm/card${i}/device/hwmon/hwmon0/temp1_input`
+                    ];
+                    for (let tempPath of tempPaths) {
+                        let [tok,tc]=GLib.spawn_command_line_sync(`sudo cat ${tempPath}`);
+                        if(tok){
+                            temp=Math.round(parseInt(imports.byteArray.toString(tc).trim())/1000);
+                            if (temp > 0 && temp < 150) break;
+                        }
+                    }
+                } catch(e){}
+                
+                // Get GPU name from lspci with sudo
+                try {
+                    let [ok,addr] = GLib.spawn_command_line_sync(`sudo cat /sys/class/drm/card${i}/device/address`);
+                    if (ok) {
+                        let addrStr = imports.byteArray.toString(addr).trim();
+                        if (gpuNames[addrStr]) {
+                            name = gpuNames[addrStr].replace(/Intel Corporation\s*/i, 'Intel ');
+                        }
+                    }
+                } catch(e){}
+                
+                // Use card identifier to distinguish multiple Intel GPUs
+                let cardId = `intel_${i}`;
+                if (!detectedIntelGPUs.has(cardId)) {
+                    detectedIntelGPUs.add(cardId);
+                    
+                    // Determine GPU type
+                    let gpuType = 'intel';
+                    if (name.toLowerCase().includes('3rd gen') || name.toLowerCase().includes('core processor')) {
+                        gpuType = 'intel_igpu';
+                        if (!name.includes('(iGPU)')) name += ' (iGPU)';
+                    } else if (name.toLowerCase().includes('arc') || name.toLowerCase().includes('iris xe')) {
+                        gpuType = 'intel_dgpu';
+                        if (!name.includes('(dGPU)')) name += ' (dGPU)';
+                    } else if (detectedIntelGPUs.size === 1) {
+                        gpuType = 'intel_igpu';
+                        if (!name.includes('(iGPU)')) name += ' (iGPU)';
+                    } else {
+                        gpuType = 'intel_dgpu';
+                        if (!name.includes('(dGPU)')) name += ' (dGPU)';
+                    }
+                    
+                    gpus.push({name:name.replace(/Intel\s*/i, '').trim(),usage:-1,temp,type:gpuType});
+                }
+            }
+        }
+    } catch(e){}
+    
     return gpus;
 }
 
@@ -153,6 +303,7 @@ function createSystemMonitorBox() {
             .sysmon-frame { padding: 6px; }
             .sysmon-title { font-size: 1.15em; font-weight: 700; color: @primary; margin-bottom: 6px; }
             .gauge-label { font-size: 0.78em; font-weight: 600; color: @primary; margin-top: 1px; }
+            .gauge-subtitle { font-size: 0.92em; font-weight: 500; color: @primary; margin-bottom: 2px; opacity: 0.75; }
             .sysmon-info { font-size: 0.82em; font-weight: 500; color: @primary; margin-top: 2px; }
         `, -1);
         Gtk.StyleContext.add_provider_for_display(display, css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION);
@@ -179,12 +330,23 @@ function createSystemMonitorBox() {
             let lo=PangoCairo.create_layout(cr); lo.set_text(glyph,-1); lo.set_font_description(_fdG); let [gw,gh]=lo.get_pixel_size(); cr.moveTo(cx-gw/2,cy-gh-1); PangoCairo.show_layout(cr,lo);
             cr.setSourceRGBA(_tc.r,_tc.g,_tc.b,1.0);
             lo=PangoCairo.create_layout(cr); lo.set_text(_v,-1); lo.set_font_description(_fdV); let [vw,vh]=lo.get_pixel_size(); cr.moveTo(cx-vw/2,cy-vh/2+5); PangoCairo.show_layout(cr,lo);
-            if (_s) { cr.setSourceRGBA(_tc.r,_tc.g,_tc.b,0.55); lo=PangoCairo.create_layout(cr); lo.set_text(_s,-1); lo.set_font_description(_fdS); let [sw]=lo.get_pixel_size(); cr.moveTo(cx-sw/2,cy+vh/2+3); PangoCairo.show_layout(cr,lo); }
+            // Remove subtitle from gauge drawing - will be handled by separate label
         });
+        const subtitleLbl = new Gtk.Label({halign:Gtk.Align.CENTER}); subtitleLbl.add_css_class('gauge-subtitle');
         const lbl = new Gtk.Label({label:labelText,halign:Gtk.Align.CENTER}); lbl.add_css_class('gauge-label');
-        const box = new Gtk.Box({orientation:Gtk.Orientation.VERTICAL,spacing:0,halign:Gtk.Align.CENTER}); box.append(da); box.append(lbl);
-        return { widget:box, da, lbl,
-            update(fr,vt,st) { let f=Math.max(0,Math.min(1,fr)); if(f!==_f||vt!==_v||(st||'')!==_s){_f=f;_v=vt;_s=st||'';da.queue_draw();} },
+        const box = new Gtk.Box({orientation:Gtk.Orientation.VERTICAL,spacing:0,halign:Gtk.Align.CENTER}); 
+        box.append(subtitleLbl); 
+        box.append(da); 
+        box.append(lbl);
+        return { widget:box, da, lbl, subtitleLbl,
+            update(fr,vt,st) { 
+                let f=Math.max(0,Math.min(1,fr)); 
+                if(f!==_f||vt!==_v||(st||'')!==_s){
+                    _f=f;_v=vt;_s=st||'';da.queue_draw();
+                    // Update subtitle label
+                    subtitleLbl.set_label(st||'');
+                } 
+            },
             setLabel(t){lbl.set_label(t);}
         };
     }
