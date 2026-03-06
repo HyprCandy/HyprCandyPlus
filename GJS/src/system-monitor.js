@@ -397,7 +397,26 @@ function createSystemMonitorBox() {
     }
 
     let _tid=0, _gcc=0;
-    function _start() { _resolveColor(mainBox); updateAll(); if(!_tid) _tid=GLib.timeout_add(GLib.PRIORITY_DEFAULT,2000,()=>{updateAll();if(++_gcc>=5){_gcc=0;_resolveColor(mainBox);imports.system.gc();}return GLib.SOURCE_CONTINUE;}); }
+    function _start() { 
+        _resolveColor(mainBox); 
+        updateAll(); 
+        if(!_tid) _tid=GLib.timeout_add(GLib.PRIORITY_DEFAULT,2000,()=>{
+            updateAll();
+            if(++_gcc>=1){  // Check every 2 seconds instead of every 5 updates (10 seconds)
+                _gcc=0;
+                _resolveColor(mainBox);
+                // Force all gauges to redraw with new colors
+                cpuG.da.queue_draw();
+                ramG.da.queue_draw();
+                tmpG.da.queue_draw();
+                swpG.da.queue_draw();
+                for (let g of gpuGs) g.da.queue_draw();
+                for (let g of diskGs) g.da.queue_draw();
+                imports.system.gc();
+            }
+            return GLib.SOURCE_CONTINUE;
+        });
+    }
     function _stop() { if(_tid){GLib.source_remove(_tid);_tid=0;} }
     mainBox.connect('map',()=>_start()); mainBox.connect('unmap',()=>_stop()); mainBox.connect('destroy',()=>_stop());
     updateAll();
