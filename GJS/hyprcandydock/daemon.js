@@ -100,7 +100,7 @@ var Daemon = class {
     
     // Load pinned apps efficiently
     loadPinnedApps() {
-        const pinnedFile = `${GLib.getenv('HOME')}/.config/nwg-dock-hyprland/pinned`;
+        const pinnedFile = `${GLib.getenv('HOME')}/.hyprcandy/GJS/hyprcandydock/pinned`;
         const file = Gio.File.new_for_path(pinnedFile);
         
         if (file.query_exists(null)) {
@@ -356,7 +356,7 @@ var Daemon = class {
     
     // Save pinned apps
     savePinnedApps() {
-        const pinnedFile = `${GLib.getenv('HOME')}/.config/nwg-dock-hyprland/pinned`;
+        const pinnedFile = `${GLib.getenv('HOME')}/.hyprcandy/GJS/hyprcandydock/pinned`;
         const file = Gio.File.new_for_path(pinnedFile);
 
         const content = Array.from(this.pinnedApps).join('\n') + '\n';
