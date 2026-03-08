@@ -1,7 +1,7 @@
 /* HyprCandy Dock Theme - Matugen Colors
  * Background: @blur_background
  * Glyphs/Icons: @primary
- * Border: @on_primary_fixed_dim
+ * Border: @on_primary_fixed_variant
  * No hover effects - tooltips only
  */
 
@@ -11,7 +11,7 @@ window.background {
     border-radius: 20px;
     border-style: solid;
     border-width: 2px;
-    border-color: @on_primary_fixed_dim;
+    border-color: @on_primary_fixed_variant;
 }
 
 /* Main dock container - size from padding only */
@@ -85,7 +85,7 @@ window.background {
 
 /* Separator between sections */
 separator {
-    background-color: @on_primary_fixed_dim;
+    background-color: @on_primary_fixed_variant;
     opacity: 0.3;
     min-width: 1px;
     margin: 0px 4px;
@@ -94,7 +94,7 @@ separator {
 /* Context menu popover */
 popover.background {
     background-color: @blur_background;
-    border: 2px solid @on_primary_fixed_dim;
+    border: 2px solid @on_primary_fixed_variant;
     border-radius: 12px;
 }
 
