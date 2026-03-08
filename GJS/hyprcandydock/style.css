@@ -1,42 +1,50 @@
-/* HyprCandy Dock Theme - Matugen Colors */
+/* HyprCandy Dock Theme - Matugen Colors
+ * Background: @blur_background
+ * Glyphs/Icons: @primary
+ * Border: @on_primary_fixed_dim
+ * No hover effects - tooltips only
+ */
 
+/* Dock window - background and border */
 window.background {
     background-color: @blur_background;
     border-radius: 20px;
     border-style: solid;
     border-width: 2px;
-    border-color: @on_primary_fixed_variant;
+    border-color: @on_primary_fixed_dim;
 }
 
-#box {
+/* Main dock container - size from padding only */
+#dock-box {
     padding: 4px;
     background-color: transparent;
 }
 
-#indicator-box {
-    padding: 0px 4px 2px 4px;
-    background-color: transparent;
+/* App container (button + indicator) */
+.app-container {
+    padding: 0px;
+    margin: 0px;
 }
 
-#active {
-    border-bottom: none;
-}
-
+/* Active indicator - sits on bottom edge of dock */
+.active-indicator,
 #active-indicator {
     color: @primary;
     font-size: 4px;
     padding: 0px;
     margin: 0px;
+    min-height: 0;
 }
 
+/* Glyph icons for start and trash */
 #start-icon, #trash-icon {
     color: @primary;
     font-size: 22px;
     padding: 4px;
 }
 
-/* Complete button reset - remove all backgrounds and effects */
-button, .app-button {
+/* Complete button reset - no hover, no backgrounds */
+.dock-button {
     all: unset;
     background: none;
     background-color: transparent;
@@ -49,53 +57,44 @@ button, .app-button {
     min-height: 0;
 }
 
-button:hover, .app-button:hover {
+.dock-button:hover {
     all: unset;
     background: none;
     background-color: transparent;
 }
 
-button:focus, .app-button:focus {
+.dock-button:focus {
+    all: unset;
+    background: none;
+    background-color: transparent;
+    outline: none;
+}
+
+.dock-button:active {
     all: unset;
     background: none;
     background-color: transparent;
 }
 
-button:active, .app-button:active {
-    all: unset;
+.dock-button image {
     background: none;
     background-color: transparent;
+    border: none;
+    box-shadow: none;
 }
 
-button:disabled, .app-button:disabled {
-    all: unset;
-    background: none;
-    background-color: transparent;
-}
-
-button *, .app-button * {
-    all: unset;
-    background: none;
-    background-color: transparent;
-}
-
-.app-button image {
-    all: unset;
-    background: none;
-    background-color: transparent;
-}
-
+/* Separator between sections */
 separator {
-    background-color: @on_primary_fixed_variant;
+    background-color: @on_primary_fixed_dim;
     opacity: 0.3;
     min-width: 1px;
     margin: 0px 4px;
 }
 
-/* Context menu styling */
+/* Context menu popover */
 popover.background {
     background-color: @blur_background;
-    border: 2px solid @on_primary_fixed_variant;
+    border: 2px solid @on_primary_fixed_dim;
     border-radius: 12px;
 }
 
@@ -103,14 +102,48 @@ popover.background * {
     background-color: transparent;
 }
 
-menuitem {
+/* Popover items */
+.popover-item {
+    all: unset;
     background: none;
     background-color: transparent;
     padding: 6px 12px;
     border-radius: 6px;
+    color: @primary;
 }
 
-menuitem:hover {
-    background-color: @primary;
-    color: @blur_background;
+.popover-item:hover {
+    background-color: alpha(@primary, 0.15);
+}
+
+.popover-action {
+    font-size: 12px;
+    padding: 4px 8px;
+}
+
+.popover-sublabel {
+    font-size: 11px;
+    font-weight: bold;
+    padding: 4px 8px;
+    opacity: 0.7;
+    color: @primary;
+}
+
+.popover-toggle {
+    all: unset;
+    background: none;
+    background-color: transparent;
+    padding: 4px 8px;
+    color: @primary;
+    font-size: 10px;
+}
+
+.popover-toggle:hover {
+    background-color: alpha(@primary, 0.1);
+    border-radius: 4px;
+}
+
+/* Tooltip positioning above dock */
+tooltip {
+    margin-top: -8px;
 }

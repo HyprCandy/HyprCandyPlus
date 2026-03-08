@@ -1,589 +1,599 @@
 #!/usr/bin/env gjs
 
-// HyprCandy Dock - GNOME Dash-style Implementation
-// Based on GNOME 49 dash/dock architecture with HyprCandy theming
+// HyprCandy Dock - GTK4 Layer Shell Dock
+// Replaces nwg-dock-hyprland with modern GTK4/GJS implementation
+// Features: hot color reloading, glyph icons, popover menus, Hyprland socket IPC
 
 imports.gi.versions.Gtk = '4.0';
 imports.gi.versions.Gdk = '4.0';
 
-const {Gtk, Gdk, Gio, GLib, GObject} = imports.gi;
+const { Gtk, Gdk, Gio, GLib, GObject } = imports.gi;
 const Gtk4LayerShell = imports.gi.Gtk4LayerShell;
 
-// Import modern daemon
-imports.searchPath.unshift('.');
+// Script directory for imports
+const SCRIPT_DIR = GLib.path_get_dirname(imports.system.programInvocationName);
+imports.searchPath.unshift(SCRIPT_DIR);
+imports.searchPath.unshift(GLib.build_filenamev([SCRIPT_DIR, '..', 'src']));
+
 const Daemon = imports.daemon.Daemon;
 
-// Icon size constant - easily adjustable
+// --- Dock configuration -----------------------------------------------
 const ICON_SIZE = 22;
 const INDICATOR_FONT_SIZE = 4;
 const BUTTON_PADDING = 4;
-const DOCK_MIN_WIDTH = 100;
+const DOCK_SPACING = 2;
 
-const Dock = GObject.registerClass({
+// Glyph icons (Nerd Font codepoints)
+const GLYPH_START = '\uF17C';
+const GLYPH_INDICATOR = '\u{F09DF}';
+const GLYPH_TRASH = '\u{F0A5A}';
+
+// Color CSS paths
+const HOME = GLib.get_home_dir();
+const GTK4_COLORS_PATH = GLib.build_filenamev([HOME, '.config', 'gtk-4.0', 'colors.css']);
+const GTK3_COLORS_PATH = GLib.build_filenamev([HOME, '.config', 'gtk-3.0', 'colors.css']);
+const DOCK_STYLE_PATH = GLib.build_filenamev([HOME, '.hyprcandy', 'GJS', 'hyprcandydock', 'style.css']);
+const LOCAL_STYLE_PATH = GLib.build_filenamev([SCRIPT_DIR, 'style.css']);
+
+// --- CSS Hot Reload ---------------------------------------------------
+let cssProviders = [];
+let reloadPending = false;
+let matugenCheckId = null;
+let fileMonitors = [];
+let dockWindow = null;
+
+function isMatugenRunning() {
+    try {
+        const [ok, stdout, , status] = GLib.spawn_command_line_sync('pgrep -x matugen');
+        return ok && status === 0 && stdout.toString().trim().length > 0;
+    } catch (e) {
+        return false;
+    }
+}
+
+function performCSSReload() {
+    if (reloadPending) return;
+    reloadPending = true;
+
+    GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+        try {
+            print('[dock] Reloading theme colors...');
+            const display = Gdk.Display.get_default();
+
+            // Remove old providers
+            for (const provider of cssProviders) {
+                try {
+                    Gtk.StyleContext.remove_provider_for_display(display, provider);
+                } catch (e) { /* ignore */ }
+            }
+            cssProviders = [];
+
+            // Reload GTK3 colors (matugen named colors)
+            if (GLib.file_test(GTK3_COLORS_PATH, GLib.FileTest.EXISTS)) {
+                const gtk3Provider = new Gtk.CssProvider();
+                gtk3Provider.load_from_path(GTK3_COLORS_PATH);
+                Gtk.StyleContext.add_provider_for_display(display, gtk3Provider, Gtk.STYLE_PROVIDER_PRIORITY_USER);
+                cssProviders.push(gtk3Provider);
+            }
+
+            // Reload GTK4 colors
+            if (GLib.file_test(GTK4_COLORS_PATH, GLib.FileTest.EXISTS)) {
+                const gtk4Provider = new Gtk.CssProvider();
+                gtk4Provider.load_from_path(GTK4_COLORS_PATH);
+                Gtk.StyleContext.add_provider_for_display(display, gtk4Provider, Gtk.STYLE_PROVIDER_PRIORITY_USER);
+                cssProviders.push(gtk4Provider);
+            }
+
+            // Reload dock style (user override first, then local fallback)
+            const stylePath = GLib.file_test(DOCK_STYLE_PATH, GLib.FileTest.EXISTS)
+                ? DOCK_STYLE_PATH
+                : LOCAL_STYLE_PATH;
+            if (GLib.file_test(stylePath, GLib.FileTest.EXISTS)) {
+                const styleProvider = new Gtk.CssProvider();
+                styleProvider.load_from_path(stylePath);
+                Gtk.StyleContext.add_provider_for_display(display, styleProvider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION);
+                cssProviders.push(styleProvider);
+            }
+
+            // Refresh the dock window
+            if (dockWindow && dockWindow.get_visible()) {
+                dockWindow.queue_draw();
+            }
+
+            print('[dock] Theme colors hot-reloaded');
+        } catch (e) {
+            print('[dock] CSS reload error: ' + e.message);
+        } finally {
+            reloadPending = false;
+        }
+        return false;
+    });
+}
+
+function waitForMatugenAndReload() {
+    if (matugenCheckId) {
+        GLib.source_remove(matugenCheckId);
+        matugenCheckId = null;
+    }
+
+    if (!isMatugenRunning()) {
+        performCSSReload();
+        return;
+    }
+
+    print('[dock] Matugen running, waiting...');
+    matugenCheckId = GLib.timeout_add(GLib.PRIORITY_DEFAULT_IDLE, 300, () => {
+        if (!isMatugenRunning()) {
+            matugenCheckId = null;
+            GLib.timeout_add(GLib.PRIORITY_DEFAULT_IDLE, 100, () => {
+                performCSSReload();
+                return false;
+            });
+            return false;
+        }
+        return true;
+    });
+}
+
+function setupFileMonitors() {
+    const pathsToWatch = [GTK4_COLORS_PATH, GTK3_COLORS_PATH, DOCK_STYLE_PATH, LOCAL_STYLE_PATH];
+
+    for (const path of pathsToWatch) {
+        if (!GLib.file_test(path, GLib.FileTest.EXISTS)) continue;
+        try {
+            const file = Gio.File.new_for_path(path);
+            const monitor = file.monitor_file(Gio.FileMonitorFlags.NONE, null);
+            monitor.connect('changed', () => {
+                print('[dock] CSS change detected: ' + GLib.path_get_basename(path));
+                waitForMatugenAndReload();
+            });
+            fileMonitors.push(monitor);
+            print('[dock] Monitoring: ' + GLib.path_get_basename(path));
+        } catch (e) {
+            print('[dock] Monitor error for ' + path + ': ' + e.message);
+        }
+    }
+}
+
+function cleanupMonitors() {
+    if (matugenCheckId) {
+        GLib.source_remove(matugenCheckId);
+        matugenCheckId = null;
+    }
+    for (const mon of fileMonitors) {
+        try { mon.cancel(); } catch (e) { /* ignore */ }
+    }
+    fileMonitors = [];
+}
+
+// --- SIGUSR1 handler for manual hot refresh ---------------------------
+function setupSignalHandler() {
+    try {
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, 10, () => {
+            print('[dock] SIGUSR1 received - hot refreshing...');
+            performCSSReload();
+            return true;
+        });
+        print('[dock] SIGUSR1 handler registered');
+    } catch (e) {
+        print('[dock] Could not register SIGUSR1 handler: ' + e.message);
+    }
+}
+
+// --- Dock Widget ------------------------------------------------------
+const HyprCandyDock = GObject.registerClass({
     GTypeName: 'HyprCandyDock',
-}, class Dock extends Gtk.ApplicationWindow {
-    _init() {
+}, class HyprCandyDock extends Gtk.ApplicationWindow {
+    _init(app) {
         super._init({
+            application: app,
             title: 'HyprCandy Dock',
             decorated: false,
         });
 
-        // Modern daemon-based architecture
         this.daemon = new Daemon(this);
-        this.clientWidgets = new Map(); // Cache widgets
+        this.clientWidgets = new Map();
+        this._startSeparator = null;
+        this._endSeparator = null;
+        this._trashButton = null;
 
-        // Setup window and layer shell
         this.setupLayerShell();
         this.createDock();
-
-        // Load initial data and start monitoring
         this.initializeDock();
     }
 
     setupLayerShell() {
-        // Modern GTK4 Layer Shell setup
         Gtk4LayerShell.init_for_window(this);
         Gtk4LayerShell.set_namespace(this, 'hyprcandy-dock');
-
-        // Configure for bottom dock - only anchor bottom, not sides
         Gtk4LayerShell.set_layer(this, Gtk4LayerShell.Layer.OVERLAY);
+
+        // Anchor bottom only - dock floats at bottom center
         Gtk4LayerShell.set_anchor(this, Gtk4LayerShell.Edge.BOTTOM, true);
         Gtk4LayerShell.set_anchor(this, Gtk4LayerShell.Edge.LEFT, false);
         Gtk4LayerShell.set_anchor(this, Gtk4LayerShell.Edge.RIGHT, false);
         Gtk4LayerShell.set_anchor(this, Gtk4LayerShell.Edge.TOP, false);
 
-        // Set exclusive zone to 40 (reserved space for dock - slightly larger than dock height)
+        // Exclusive zone: reserve space for dock
         Gtk4LayerShell.set_exclusive_zone(this, 40);
 
-        // Margins: 6px from screen edge bottom, 10px left/right for gap
+        // Margins from screen edge
         Gtk4LayerShell.set_margin(this, Gtk4LayerShell.Edge.BOTTOM, 6);
-        Gtk4LayerShell.set_margin(this, Gtk4LayerShell.Edge.LEFT, 10);
-        Gtk4LayerShell.set_margin(this, Gtk4LayerShell.Edge.RIGHT, 10);
 
-        console.log('🪟 Layer shell configured for hyprcandy-dock');
+        print('[dock] Layer shell configured');
     }
 
     createDock() {
-        // Create horizontal box for all elements
         this.mainBox = Gtk.Box.new(Gtk.Orientation.HORIZONTAL, 0);
-        this.mainBox.set_name('box');
+        this.mainBox.set_name('dock-box');
         this.mainBox.set_halign(Gtk.Align.CENTER);
-        
+        this.mainBox.set_valign(Gtk.Align.END);
+
         this.set_child(this.mainBox);
-        
-        // Set minimum width for dock to shrink properly
-        this.set_default_size(DOCK_MIN_WIDTH, -1);
-
-        // Apply modern CSS
-        this.applyCSS();
-
-        console.log('🎨 Unified layer dock with per-app indicators created');
-    }
-
-    applyCSS() {
-        const cssProvider = new Gtk.CssProvider();
-
-        // Modern CSS with matugen variables - Precise GTK override targeting
-        const css = `
-            window.background {
-                background-color: @blur_background;
-                border-radius: 30px;
-                border-style: solid;
-                border-width: 2px;
-                border-color: @on_primary_fixed_variant;
-            }
-
-            #box {
-                padding: 0px;
-                background: transparent;
-            }
-
-            #active-indicator {
-                color: @primary;
-                font-size: ${INDICATOR_FONT_SIZE}px;
-                padding: 0px;
-                margin: 0px;
-                min-width: 3px;
-            }
-
-            #start-icon {
-                color: @primary;
-                font-size: ${ICON_SIZE}px;
-            }
-
-            #trash-icon {
-                color: @primary;
-                font-size: ${ICON_SIZE}px;
-            }
-
-            /* Precise button targeting like swync example */
-            #box > box > button {
-                background: transparent;
-                border: none;
-                box-shadow: none;
-                padding: 2px;
-                margin: 0px 1px;
-                min-width: ${ICON_SIZE + 4}px;
-                min-height: ${ICON_SIZE + 4}px;
-                -gtk-icon-effect: none;
-                background-image: none;
-                background-color: transparent;
-            }
-
-            #box > box > button:hover {
-                background: transparent;
-                border: none;
-                box-shadow: none;
-                -gtk-icon-effect: none;
-                background-image: none;
-                background-color: transparent;
-            }
-
-            #box > box > button:focus {
-                background: transparent;
-                border: none;
-                box-shadow: none;
-                outline: none;
-                -gtk-icon-effect: none;
-                background-image: none;
-                background-color: transparent;
-            }
-
-            #box > box > button:active {
-                background: transparent;
-                border: none;
-                box-shadow: none;
-                -gtk-icon-effect: none;
-                background-image: none;
-                background-color: transparent;
-            }
-
-            #box > box > button image {
-                background: transparent;
-                border: none;
-                box-shadow: none;
-                -gtk-icon-style: regular;
-                padding: 2px;
-                border-radius: 50%;
-                -gtk-icon-effect: none;
-            }
-
-            /* Fallback broader targeting */
-            .app-icon {
-                background: transparent;
-                border: none;
-                box-shadow: none;
-                padding: 2px;
-                margin: 0px 1px;
-                min-width: ${ICON_SIZE + 4}px;
-                min-height: ${ICON_SIZE + 4}px;
-                -gtk-icon-effect: none;
-                background-image: none;
-                background-color: transparent;
-            }
-
-            .app-icon:hover,
-            .app-icon:focus,
-            .app-icon:active {
-                background: transparent;
-                border: none;
-                box-shadow: none;
-                -gtk-icon-effect: none;
-                background-image: none;
-                background-color: transparent;
-            }
-
-            /* Popover override mechanism */
-            popover {
-                background: transparent;
-                border: none;
-                box-shadow: none;
-                -gtk-icon-effect: none;
-            }
-
-            popover > contents {
-                background: @blur_background;
-                border: 1px solid @on_primary_fixed_variant;
-                border-radius: 12px;
-                box-shadow: 0 4px 12px alpha(@black, 0.3);
-            }
-
-            separator {
-                background-color: @on_primary_fixed_variant;
-                opacity: 0.3;
-                min-width: 1px;
-                margin: 0px 8px;
-            }
-
-            /* Tooltip positioning above dock */
-            tooltip {
-                margin-top: -8px;
-            }
-        `;
-
-        cssProvider.load_from_data(css, -1);
-
-        const styleContext = this.get_style_context();
-        styleContext.add_provider(cssProvider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION);
-
-        console.log('🎨 HyprCandy CSS theme applied');
+        print('[dock] Dock container created');
     }
 
     async initializeDock() {
-        // Add start button at beginning
-        this.addStartButton();
-        
-        // Add separator after start button
-        this.addStartSeparator();
-        
-        // Load initial clients (apps go between separators)
+        // Build layout: Start | Separator | [apps] | Separator | Trash
+        this._addStartButton();
+        this._addSeparator('start');
+
+        // Load running apps
         await this.daemon.loadInitialClients();
-        
-        // Start efficient event monitoring
         this.daemon.startEventMonitoring();
-        
-        // Add separator before trash button
-        this.addEndSeparator();
-        
-        // Add trash button at end
-        this.addTrashButton();
-        
-        // Show dock
+
+        this._addSeparator('end');
+        this._addTrashButton();
+
         this.show();
-        
-        console.log('🚀 HyprCandy dock initialized');
+        print('[dock] Dock initialized');
     }
 
-    // Update dock from daemon data - INCREMENTAL UPDATES
+    // --- Start button -------------------------------------------------
+    _addStartButton() {
+        const btn = Gtk.Button.new();
+        btn.add_css_class('dock-button');
+        btn.add_css_class('start-button');
+
+        const label = Gtk.Label.new(GLYPH_START);
+        label.set_name('start-icon');
+        btn.set_child(label);
+        btn.set_tooltip_text('Applications');
+
+        // Left click -> rofi
+        btn.connect('clicked', () => {
+            GLib.spawn_command_line_async('rofi -show drun');
+        });
+
+        // Right click -> start menu popover
+        const gesture = new Gtk.GestureClick();
+        gesture.set_button(3);
+        gesture.connect('pressed', () => {
+            this._showStartMenu(btn);
+        });
+        btn.add_controller(gesture);
+
+        this.mainBox.append(btn);
+    }
+
+    _showStartMenu(parentButton) {
+        const popover = new Gtk.Popover();
+        popover.set_parent(parentButton);
+        popover.set_has_arrow(false);
+        popover.add_css_class('dock-popover');
+
+        const menuBox = Gtk.Box.new(Gtk.Orientation.VERTICAL, 2);
+        menuBox.set_margin_start(6);
+        menuBox.set_margin_end(6);
+        menuBox.set_margin_top(6);
+        menuBox.set_margin_bottom(6);
+
+        const items = [
+            { label: 'Applications', cmd: 'rofi -show drun' },
+            { label: 'Files', cmd: 'nautilus' },
+            { label: 'Terminal', cmd: 'kitty' },
+            { label: 'Settings', cmd: 'gnome-control-center' },
+        ];
+
+        for (const item of items) {
+            const btn = Gtk.Button.new_with_label(item.label);
+            btn.add_css_class('popover-item');
+            btn.set_halign(Gtk.Align.FILL);
+            btn.connect('clicked', () => {
+                GLib.spawn_command_line_async(item.cmd);
+                popover.popdown();
+            });
+            menuBox.append(btn);
+        }
+
+        popover.set_child(menuBox);
+        popover.popup();
+    }
+
+    // --- Separators ---------------------------------------------------
+    _addSeparator(tag) {
+        const sep = Gtk.Separator.new(Gtk.Orientation.VERTICAL);
+        sep.set_name('separator-' + tag);
+        this.mainBox.append(sep);
+        if (tag === 'start') this._startSeparator = sep;
+        if (tag === 'end') this._endSeparator = sep;
+    }
+
+    // --- Trash button -------------------------------------------------
+    _addTrashButton() {
+        const btn = Gtk.Button.new();
+        btn.add_css_class('dock-button');
+        btn.add_css_class('trash-button');
+
+        const label = Gtk.Label.new(GLYPH_TRASH);
+        label.set_name('trash-icon');
+        btn.set_child(label);
+        btn.set_tooltip_text('Trash');
+
+        btn.connect('clicked', () => {
+            GLib.spawn_command_line_async('nautilus trash:///');
+        });
+
+        this._trashButton = btn;
+        this.mainBox.append(btn);
+    }
+
+    // --- App buttons (incremental update from daemon) -----------------
     updateFromDaemon(clientData) {
         const currentClasses = new Set(this.clientWidgets.keys());
         const newClasses = new Set(clientData.map(d => d.className));
-        
-        // Remove widgets for apps that no longer exist
+
+        // Remove widgets for apps no longer present
         for (const className of currentClasses) {
             if (!newClasses.has(className)) {
                 const widget = this.clientWidgets.get(className);
                 if (widget) {
                     this.mainBox.remove(widget);
                     this.clientWidgets.delete(className);
-                    console.log(`➖ Removed ${className} from dock`);
+                    print('[dock] Removed: ' + className);
                 }
             }
         }
-        
-        // Add or update widgets for current apps
-        clientData.forEach(data => {
+
+        // Add or update widgets
+        for (const data of clientData) {
             if (!this.clientWidgets.has(data.className)) {
-                // Add new widget
-                this.addClientButton(data);
-                console.log(`➕ Added ${data.className} to dock`);
+                this._addClientButton(data);
             } else {
-                // Update existing widget
-                this.updateClientButton(data);
+                this._updateClientButton(data);
+            }
+        }
+
+        // Reorder: ensure end separator and trash stay last
+        if (this._endSeparator) {
+            this.mainBox.reorder_child_after(this._endSeparator, this._getLastAppWidget());
+        }
+        if (this._trashButton) {
+            this.mainBox.reorder_child_after(this._trashButton, this._endSeparator);
+        }
+    }
+
+    _getLastAppWidget() {
+        let last = this._startSeparator;
+        for (const [, widget] of this.clientWidgets) {
+            last = widget;
+        }
+        return last;
+    }
+
+    _addClientButton(data) {
+        // Vertical container: icon button on top, indicator at bottom edge
+        const container = Gtk.Box.new(Gtk.Orientation.VERTICAL, 0);
+        container.set_halign(Gtk.Align.CENTER);
+        container.set_valign(Gtk.Align.END);
+        container.add_css_class('app-container');
+
+        // Icon button
+        const btn = Gtk.Button.new();
+        btn.add_css_class('dock-button');
+        btn.add_css_class('app-button');
+        btn.set_name('app-' + data.className);
+
+        const icon = Gtk.Image.new_from_icon_name(this.daemon.getIcon(data.className));
+        icon.set_pixel_size(ICON_SIZE);
+        icon.set_halign(Gtk.Align.CENTER);
+        btn.set_child(icon);
+
+        // Tooltip with instance count
+        const tooltipText = data.instances.length > 1
+            ? data.className + ' (' + data.instances.length + ')'
+            : data.className;
+        btn.set_tooltip_text(tooltipText);
+
+        // Left click -> focus first instance
+        btn.connect('clicked', () => {
+            if (data.instances.length > 0) {
+                this.daemon.focusWindow(data.instances[0].address);
             }
         });
-        
-        console.log(`🔄 Incremental dock update: ${clientData.length} apps`);
+
+        // Right click -> context menu
+        const gesture = new Gtk.GestureClick();
+        gesture.set_button(3);
+        gesture.connect('pressed', () => {
+            this._showContextMenu(data, btn);
+        });
+        btn.add_controller(gesture);
+
+        // Active indicator glyph on bottom edge
+        const indicator = Gtk.Label.new('');
+        indicator.set_name('active-indicator');
+        indicator.add_css_class('active-indicator');
+        indicator.set_halign(Gtk.Align.CENTER);
+        indicator.set_valign(Gtk.Align.END);
+
+        const instanceCount = data.instances ? data.instances.length : 0;
+        if (instanceCount > 0) {
+            indicator.set_text(GLYPH_INDICATOR.repeat(Math.min(instanceCount, 2)));
+        }
+
+        container.append(btn);
+        container.append(indicator);
+
+        // Insert before end separator
+        if (this._endSeparator) {
+            this.mainBox.insert_child_after(container, this._getLastAppWidget());
+        } else {
+            this.mainBox.append(container);
+        }
+
+        this.clientWidgets.set(data.className, container);
     }
-    
-    // Update existing button without recreating
-    updateClientButton(data) {
+
+    _updateClientButton(data) {
         const container = this.clientWidgets.get(data.className);
         if (!container) return;
 
-        // Get the button from the container (first child)
-        const button = container.get_first_child();
-        
-        // Update styling
-        const styleContext = button.get_style_context();
-        styleContext.remove_class('active');
-        styleContext.remove_class('pinned');
-
-        if (data.active) {
-            styleContext.add_class('active');
-        }
-        if (data.pinned) {
-            styleContext.add_class('pinned');
+        // Update tooltip on button (first child)
+        const btn = container.get_first_child();
+        if (btn) {
+            const tooltipText = data.instances.length > 1
+                ? data.className + ' (' + data.instances.length + ')'
+                : data.className;
+            btn.set_tooltip_text(tooltipText);
         }
 
-        // Update tooltip
-        const tooltip = `${data.className}${data.instances.length > 1 ? ` (${data.instances.length})` : ''}`;
-        button.set_tooltip_text(tooltip);
-        
-        // Update indicator
-        this.updateButtonIndicator(container, data);
-    }
-    
-    // Update indicator for a specific app container
-    updateButtonIndicator(container, data) {
-        // Get the indicator from the container (second child)
-        let child = container.get_first_child(); // button
-        const indicator = child ? child.get_next_sibling() : null; // indicator
-        
+        // Update indicator (second child)
+        const indicator = btn ? btn.get_next_sibling() : null;
         if (indicator) {
             const instanceCount = data.instances ? data.instances.length : 0;
             if (instanceCount > 0) {
-                indicator.set_text(''.repeat(Math.min(instanceCount, 2)));
+                indicator.set_text(GLYPH_INDICATOR.repeat(Math.min(instanceCount, 2)));
             } else {
                 indicator.set_text('');
             }
         }
     }
 
-    addStartButton() {
-        const startButton = Gtk.Button.new();
-        startButton.add_css_class('app-icon');
-        
-        const startLabel = Gtk.Label.new(''); // Linux glyph
-        startLabel.set_name('start-icon');
-        startButton.set_child(startLabel);
-        startButton.set_tooltip_text('Start Menu');
-        startButton.connect('clicked', () => {
-            GLib.spawn_command_line_async('rofi -show drun');
-        });
-        
-        // Right-click menu for start button
-        const gesture = new Gtk.GestureClick();
-        gesture.set_button(3);
-        gesture.connect('pressed', () => {
-            this.showStartMenu(startButton);
-        });
-        startButton.add_controller(gesture);
-        
-        this.mainBox.append(startButton);
-    }
-
-    showStartMenu(button) {
-        const menu = new Gtk.PopoverMenu();
-        
-        const actions = [
-            { label: 'Applications', action: 'rofi -show drun' },
-            { label: 'Files', action: 'nautilus' },
-            { label: 'Terminal', action: 'kitty' },
-            { label: 'Settings', action: 'gnome-control-center' },
-        ];
-        
-        const vbox = Gtk.Box.new(Gtk.Orientation.VERTICAL, 0);
-        
-        actions.forEach(item => {
-            const btn = Gtk.Button.new_with_label(item.label);
-            btn.connect('clicked', () => {
-                GLib.spawn_command_line_async(item.action);
-                menu.popdown();
-            });
-            vbox.append(btn);
-        });
-        
-        menu.set_child(vbox);
-        menu.set_parent(button);
-        menu.popup();
-    }
-
-    addStartSeparator() {
-        const separator = Gtk.Separator.new(Gtk.Orientation.VERTICAL);
-        this.mainBox.append(separator);
-    }
-    
-    addEndSeparator() {
-        const separator = Gtk.Separator.new(Gtk.Orientation.VERTICAL);
-        this.mainBox.append(separator);
-    }
-
-    addTrashButton() {
-        // Trash button at far right (no separator here - handled by addEndSeparator)
-        const trashButton = Gtk.Button.new();
-        trashButton.add_css_class('app-icon');
-        
-        const trashLabel = Gtk.Label.new('󰩺'); // Trash glyph
-        trashLabel.set_name('trash-icon');
-        trashButton.set_child(trashLabel);
-        trashButton.set_tooltip_text('Trash');
-        trashButton.connect('clicked', () => {
-            GLib.spawn_command_line_async('nautilus trash:///');
-        });
-        
-        this.mainBox.append(trashButton);
-    }
-
-    addClientButton(data) {
-        // Create vertical container for this app (icon + indicator)
-        const appContainer = Gtk.Box.new(Gtk.Orientation.VERTICAL, 0);
-        appContainer.set_halign(Gtk.Align.CENTER);
-        appContainer.set_valign(Gtk.Align.END);
-        
-        const button = Gtk.Button.new();
-        button.add_css_class('app-icon');
-        button.set_name(`client-${data.className}`);
-
-        // Set icon with fixed pixel size
-        const icon = Gtk.Image.new_from_icon_name(this.daemon.getIcon(data.className));
-        icon.set_pixel_size(ICON_SIZE);
-        icon.set_halign(Gtk.Align.CENTER);
-        button.set_child(icon);
-
-        // Style based on state
-        const styleContext = button.get_style_context();
-        if (data.active) {
-            styleContext.add_class('active');
-        }
-        if (data.pinned) {
-            styleContext.add_class('pinned');
-        }
-
-        // Tooltip
-        const tooltip = `${data.className}${data.instances.length > 1 ? ` (${data.instances.length})` : ''}`;
-        button.set_tooltip_text(tooltip);
-
-        // Click handlers - left click focuses window
-        button.connect('clicked', () => {
-            if (data.instances.length > 0) {
-                this.daemon.focusWindow(data.instances[0].address);
-            }
-        });
-
-        // Right-click menu
-        const gesture = new Gtk.GestureClick();
-        gesture.set_button(3);
-        gesture.connect('pressed', () => {
-            this.showContextMenu(data, button);
-        });
-        button.add_controller(gesture);
-
-        // Add indicator directly below the button
-        const indicator = Gtk.Label.new('');
-        indicator.set_name(`indicator-${data.className}`);
-        indicator.add_css_class('active-indicator');
-        indicator.set_halign(Gtk.Align.CENTER);
-        
-        // Set indicator text based on instance count
-        const instanceCount = data.instances ? data.instances.length : 0;
-        if (instanceCount > 0) {
-            indicator.set_text(''.repeat(Math.min(instanceCount, 2)));
-        }
-        
-        // Assemble the container
-        appContainer.append(button);
-        appContainer.append(indicator);
-        
-        this.mainBox.append(appContainer);
-        this.clientWidgets.set(data.className, appContainer);
-    }
-
-    showContextMenu(data, button) {
-        // Create GTK4-style popover context menu with extensive options
-        const popover = new Gtk.PopoverMenu();
-        popover.set_parent(button);
+    // --- Context Menu (popover) ---------------------------------------
+    _showContextMenu(data, parentButton) {
+        const popover = new Gtk.Popover();
+        popover.set_parent(parentButton);
         popover.set_has_arrow(false);
-        
-        // Create vertical box for menu items
+        popover.add_css_class('dock-popover');
+
         const menuBox = Gtk.Box.new(Gtk.Orientation.VERTICAL, 0);
         menuBox.set_margin_start(6);
         menuBox.set_margin_end(6);
         menuBox.set_margin_top(6);
         menuBox.set_margin_bottom(6);
 
-        // Add instances with their titles
+        // Per-instance entries
         data.instances.forEach((instance, idx) => {
-            const hbox = Gtk.Box.new(Gtk.Orientation.HORIZONTAL, 6);
-            hbox.set_margin_bottom(4);
+            // Instance header: icon + title (workspace)
+            const headerBox = Gtk.Box.new(Gtk.Orientation.HORIZONTAL, 6);
 
-            const icon = Gtk.Image.new_from_icon_name(this.daemon.getIcon(data.className));
-            icon.set_pixel_size(16);
-            hbox.append(icon);
+            const instanceIcon = Gtk.Image.new_from_icon_name(this.daemon.getIcon(data.className));
+            instanceIcon.set_pixel_size(16);
+            headerBox.append(instanceIcon);
 
-            const title = instance.title.length > 25 ?
-                instance.title.substring(0, 25) + "..." : instance.title;
-            const label = Gtk.Label.new(`${title} (${instance.workspace.name || '?'})`);
-            label.set_halign(Gtk.Align.START);
-            hbox.append(label);
+            const title = instance.title.length > 30
+                ? instance.title.substring(0, 30) + '...'
+                : instance.title;
+            const wsName = instance.workspace
+                ? (instance.workspace.name || instance.workspace.id || '?')
+                : '?';
+            const headerLabel = Gtk.Label.new(title + ' (' + wsName + ')');
+            headerLabel.set_halign(Gtk.Align.START);
+            headerLabel.set_hexpand(true);
+            headerBox.append(headerLabel);
 
-            // Create button for this instance
-            const btn = Gtk.Button.new();
-            btn.set_child(hbox);
-            btn.add_css_class('menu-item');
-            btn.connect('clicked', () => {
+            // Focus button for this instance
+            const focusBtn = Gtk.Button.new();
+            focusBtn.set_child(headerBox);
+            focusBtn.add_css_class('popover-item');
+            focusBtn.set_halign(Gtk.Align.FILL);
+            focusBtn.set_hexpand(true);
+            focusBtn.connect('clicked', () => {
                 this.daemon.focusWindow(instance.address);
                 popover.popdown();
             });
 
-            // Create submenu box (hidden by default)
-            const submenuBox = Gtk.Box.new(Gtk.Orientation.VERTICAL, 0);
-            submenuBox.set_margin_start(16);
-            submenuBox.visible = false;
+            // Expandable actions submenu per instance
+            const actionsBox = Gtk.Box.new(Gtk.Orientation.VERTICAL, 0);
+            actionsBox.set_margin_start(12);
+            actionsBox.visible = false;
 
             // Window actions
-            const actions = [
-                { label: 'Close Window', action: () => this.daemon.closeWindow(instance.address) },
-                { label: 'Toggle Floating', action: () => this.daemon.hyprctl(`dispatch togglefloating address:${instance.address}`) },
-                { label: 'Fullscreen', action: () => this.daemon.hyprctl(`dispatch fullscreen address:${instance.address}`) },
+            const windowActions = [
+                { label: 'Close Window', fn: () => this.daemon.closeWindow(instance.address) },
+                { label: 'Toggle Floating', fn: () => this.daemon.hyprctl('dispatch togglefloating address:' + instance.address) },
+                { label: 'Fullscreen', fn: () => this.daemon.hyprctl('dispatch fullscreen address:' + instance.address) },
             ];
 
-            actions.forEach(item => {
-                const actionBtn = Gtk.Button.new_with_label(item.label);
-                actionBtn.add_css_class('menu-action');
+            for (const wa of windowActions) {
+                const actionBtn = Gtk.Button.new_with_label(wa.label);
+                actionBtn.add_css_class('popover-item');
+                actionBtn.add_css_class('popover-action');
                 actionBtn.set_halign(Gtk.Align.FILL);
                 actionBtn.connect('clicked', () => {
-                    item.action();
+                    wa.fn();
                     popover.popdown();
                 });
-                submenuBox.append(actionBtn);
-            });
+                actionsBox.append(actionBtn);
+            }
 
             // Move to workspace submenu
-            const wsLabel = Gtk.Label.new('Move to Workspace');
-            wsLabel.set_halign(Gtk.Align.START);
-            wsLabel.add_css_class('menu-submenu-label');
-            submenuBox.append(wsLabel);
+            const wsMenuLabel = Gtk.Label.new('Move to Workspace');
+            wsMenuLabel.set_halign(Gtk.Align.START);
+            wsMenuLabel.add_css_class('popover-sublabel');
+            actionsBox.append(wsMenuLabel);
 
-            const wsBox = Gtk.Box.new(Gtk.Orientation.VERTICAL, 0);
             for (let i = 1; i <= 10; i++) {
-                const wsBtn = Gtk.Button.new_with_label(`Workspace ${i}`);
-                wsBtn.add_css_class('menu-action');
+                const wsBtn = Gtk.Button.new_with_label('\u2192 WS ' + i);
+                wsBtn.add_css_class('popover-item');
+                wsBtn.add_css_class('popover-action');
                 wsBtn.set_halign(Gtk.Align.FILL);
+                const wsNum = i;
                 wsBtn.connect('clicked', () => {
-                    this.daemon.hyprctl(`dispatch movetoworkspace ${i},address:${instance.address}`);
+                    this.daemon.hyprctl('dispatch movetoworkspace ' + wsNum + ',address:' + instance.address);
                     popover.popdown();
                 });
-                wsBox.append(wsBtn);
+                actionsBox.append(wsBtn);
             }
-            submenuBox.append(wsBox);
 
-            // GPU submenu
+            // GPU launch submenu
             const gpus = this.daemon.getAvailableGPUs();
             if (gpus.length > 0) {
                 const gpuLabel = Gtk.Label.new('Launch with GPU');
                 gpuLabel.set_halign(Gtk.Align.START);
-                gpuLabel.add_css_class('menu-submenu-label');
-                submenuBox.append(gpuLabel);
+                gpuLabel.add_css_class('popover-sublabel');
+                actionsBox.append(gpuLabel);
 
-                const gpuBox = Gtk.Box.new(Gtk.Orientation.VERTICAL, 0);
-                gpus.forEach(gpu => {
+                for (const gpu of gpus) {
                     const gpuBtn = Gtk.Button.new_with_label(gpu);
-                    gpuBtn.add_css_class('menu-action');
+                    gpuBtn.add_css_class('popover-item');
+                    gpuBtn.add_css_class('popover-action');
                     gpuBtn.set_halign(Gtk.Align.FILL);
                     gpuBtn.connect('clicked', () => {
                         this.daemon.launchWithGPU(data.className, gpu);
                         popover.popdown();
                     });
-                    gpuBox.append(gpuBtn);
-                });
-                submenuBox.append(gpuBox);
+                    actionsBox.append(gpuBtn);
+                }
             }
 
-            // Toggle submenu button
-            const toggleBtn = Gtk.Button.new_with_label('▼');
-            toggleBtn.add_css_class('menu-toggle');
+            // Toggle expand/collapse button
+            const toggleBtn = Gtk.Button.new_with_label('\u25BC');
+            toggleBtn.add_css_class('popover-toggle');
             toggleBtn.set_halign(Gtk.Align.END);
             toggleBtn.connect('clicked', () => {
-                submenuBox.visible = !submenuBox.visible;
+                actionsBox.visible = !actionsBox.visible;
+                toggleBtn.set_label(actionsBox.visible ? '\u25B2' : '\u25BC');
             });
 
-            const instanceBox = Gtk.Box.new(Gtk.Orientation.HORIZONTAL, 4);
-            instanceBox.append(btn);
-            instanceBox.append(toggleBtn);
-            menuBox.append(instanceBox);
-            menuBox.append(submenuBox);
+            // Row: [focus button] [expand toggle]
+            const instanceRow = Gtk.Box.new(Gtk.Orientation.HORIZONTAL, 4);
+            instanceRow.append(focusBtn);
+            instanceRow.append(toggleBtn);
+            menuBox.append(instanceRow);
+            menuBox.append(actionsBox);
 
+            // Separator between instances
             if (idx < data.instances.length - 1) {
                 const sep = Gtk.Separator.new(Gtk.Orientation.HORIZONTAL);
                 sep.set_margin_top(4);
@@ -592,18 +602,23 @@ const Dock = GObject.registerClass({
             }
         });
 
-        // Separator
-        const sep1 = Gtk.Separator.new(Gtk.Orientation.HORIZONTAL);
-        sep1.set_margin_top(6);
-        sep1.set_margin_bottom(6);
-        menuBox.append(sep1);
+        // Global actions
+        const globalSep = Gtk.Separator.new(Gtk.Orientation.HORIZONTAL);
+        globalSep.set_margin_top(6);
+        globalSep.set_margin_bottom(6);
+        menuBox.append(globalSep);
 
         // New window
         const newWinBtn = Gtk.Button.new_with_label('New Window');
-        newWinBtn.add_css_class('menu-item');
+        newWinBtn.add_css_class('popover-item');
         newWinBtn.set_halign(Gtk.Align.FILL);
         newWinBtn.connect('clicked', () => {
-            GLib.spawn_command_line_async(data.className.toLowerCase());
+            const execCmd = this.daemon.getExecFromDesktop(data.className);
+            if (execCmd) {
+                GLib.spawn_command_line_async(execCmd);
+            } else {
+                GLib.spawn_command_line_async(data.className.toLowerCase());
+            }
             popover.popdown();
         });
         menuBox.append(newWinBtn);
@@ -611,20 +626,20 @@ const Dock = GObject.registerClass({
         // Close all windows
         if (data.instances.length > 1) {
             const closeAllBtn = Gtk.Button.new_with_label('Close All Windows');
-            closeAllBtn.add_css_class('menu-item');
+            closeAllBtn.add_css_class('popover-item');
             closeAllBtn.set_halign(Gtk.Align.FILL);
             closeAllBtn.connect('clicked', () => {
-                data.instances.forEach(instance => {
+                for (const instance of data.instances) {
                     this.daemon.closeWindow(instance.address);
-                });
+                }
                 popover.popdown();
             });
             menuBox.append(closeAllBtn);
         }
 
-        // Pin/Unpin
+        // Pin / Unpin
         const pinBtn = Gtk.Button.new_with_label(data.pinned ? 'Unpin' : 'Pin');
-        pinBtn.add_css_class('menu-item');
+        pinBtn.add_css_class('popover-item');
         pinBtn.set_halign(Gtk.Align.FILL);
         pinBtn.connect('clicked', () => {
             this.daemon.togglePin(data.className);
@@ -636,22 +651,34 @@ const Dock = GObject.registerClass({
         popover.popup();
     }
 
+    // --- Cleanup ------------------------------------------------------
     vfunc_close_request() {
         this.daemon.shutdown();
+        cleanupMonitors();
         return false;
     }
 });
 
-// Application
-const Application = GObject.registerClass({
+// --- Application ------------------------------------------------------
+const DockApplication = GObject.registerClass({
     GTypeName: 'HyprCandyDockApplication',
-}, class Application extends Gtk.Application {
+}, class DockApplication extends Gtk.Application {
     vfunc_activate() {
-        const dock = new Dock();
-        this.add_window(dock);
+        // Initial CSS load (display-level providers)
+        performCSSReload();
+
+        // Start file monitors for hot reload
+        setupFileMonitors();
+
+        // Register SIGUSR1 handler
+        setupSignalHandler();
+
+        // Create dock
+        dockWindow = new HyprCandyDock(this);
+        this.add_window(dockWindow);
     }
 });
 
-// Launch
-const app = new Application();
+// --- Launch -----------------------------------------------------------
+const app = new DockApplication({ application_id: 'com.hyprcandy.dock' });
 app.run(ARGV);
